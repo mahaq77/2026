@@ -1,0 +1,83 @@
+1. Define the DTO
+csharppublic record UserReportDto
+{
+    public int    UserId      { get; init; }
+    public string FullName    { get; init; } = string.Empty;
+    public string Email       { get; init; } = string.Empty;
+    public int    OrderCount  { get; init; }
+    public decimal TotalSpent { get; init; }
+}
+
+2. Register the DTO as a Keyless Entity
+csharp// AppDbContext.cs
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+    // Keyless = no PK, EF won't try to track it
+    public DbSet<UserReportDto> UserReports => Set<UserReportDto>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<UserReportDto>().HasNoKey();
+    }
+}
+
+3. Call the SP via EF
+csharp// UserRepository.cs
+public class UserRepository(AppDbContext db)
+{
+    // ✅ Simple — no params
+    public async Task<List<UserReportDto>> GetUserReportAsync(CancellationToken ct = default)
+    {
+        return await db.UserReports
+            .FromSqlRaw("EXEC sp_GetUserReport")
+            .ToListAsync(ct);
+    }
+
+    // ✅ With parameters — use SqlParameter to avoid SQL injection
+    public async Task<List<UserReportDto>> GetUserReportByDateAsync(
+        DateTime from, DateTime to, CancellationToken ct = default)
+    {
+        var fromParam = new SqlParameter("@From", from);
+        var toParam   = new SqlParameter("@To",   to);
+
+        return await db.UserReports
+            .FromSqlRaw("EXEC sp_GetUserReport @From, @To", fromParam, toParam)
+            .ToListAsync(ct);
+    }
+}
+
+4. Wrap in a Response Object (optional but clean)
+csharp// Generic API response wrapper
+public record ApiResponse<T>
+{
+    public bool   Success  { get; init; }
+    public string Message  { get; init; } = string.Empty;
+    public T?     Data     { get; init; }
+
+    public static ApiResponse<T> Ok(T data)      => new() { Success = true,  Data = data };
+    public static ApiResponse<T> Fail(string msg) => new() { Success = false, Message = msg };
+}
+
+5. Controller / Minimal API Endpoint
+csharp// Minimal API (Program.cs)
+app.MapGet("/users/report", async (
+    UserRepository repo,
+    DateTime? from,
+    DateTime? to,
+    CancellationToken ct) =>
+{
+    var result = (from.HasValue && to.HasValue)
+        ? await repo.GetUserReportByDateAsync(from.Value, to.Value, ct)
+        : await repo.GetUserReportAsync(ct);
+
+    return result.Count == 0
+        ? Results.NotFound(ApiResponse<List<UserReportDto>>.Fail("No data found."))
+        : Results.Ok(ApiResponse<List<UserReportDto>>.Ok(result));
+});
+
+Key Points
+ConcernApproachNo PK on DTOUse HasNoKey() — EF won't track the entitySQL InjectionAlways use SqlParameter, never string interpolationMappingColumn names in SP result must match DTO property names (or use [Column("name")])AsyncPrefer ToListAsync() / FirstOrDefaultAsync() throughoutRegistrationRegister AppDbContext + UserRepository in DI via AddDbContext<> + AddScoped<>
+
+If the SP returns multiple result sets, EF Core can't handle that natively — you'd need to drop down to DbConnection / DbDataReader directly.
