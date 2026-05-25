@@ -1,0 +1,401 @@
+
+
+
+Same question as before — here's the full breakdown again, organized for a real company setup:
+
+---
+
+## 1. Authentication Options
+
+### API Token (simplest, most common)
+Generate at `https://id.atlassian.com/manage-profile/security/api-tokens`
+
+```env
+JIRA_BASE_URL=https://your-company.atlassian.net
+JIRA_USER_EMAIL=service-account@company.com
+JIRA_API_TOKEN=your_token_here
+CONFLUENCE_BASE_URL=https://your-company.atlassian.net/wiki
+```
+
+### OAuth 2.0 (enterprise / per-user access)
+Register your app at `https://developer.atlassian.com/console/myapps/` → choose **OAuth 2.0 (3LO)**. You get a `client_id` and `client_secret`, handle a callback URL, and must refresh tokens every 60 minutes.
+
+**Service account vs personal token — always use service account in prod:**
+
+| | Personal API Token | Service Account |
+|--|--|--|
+| Revocation risk | High (person leaves = broken) | Low |
+| Audit trail | Mixed | Clean |
+| Best for | Local dev only | Production |
+
+---
+
+## 2. Jira REST API — Key Endpoints
+
+```
+GET  /rest/api/3/issue/{issueKey}              fetch a ticket
+POST /rest/api/3/issue                         create a ticket
+PUT  /rest/api/3/issue/{issueKey}              update a ticket
+GET  /rest/api/3/search?jql=...                query with JQL
+GET  /rest/api/3/project                       list all projects
+POST /rest/api/3/issue/{issueKey}/comment      add comment
+GET  /rest/api/3/issue/{issueKey}/transitions  fetch workflow states
+POST /rest/api/3/issue/{issueKey}/transitions  move issue to new state
+GET  /rest/api/3/field                         discover custom field IDs ← do this first
+```
+
+**Before creating tickets, you must resolve these IDs** — they differ per Jira instance:
+- `projectKey` (e.g. `ENG`, `PLAT`)
+- `issuetype.id` — Story/Bug/Task IDs vary per project
+- `customfield_XXXXX` — story points, sprint, team, etc.
+
+Run `GET /rest/api/3/field` on your instance to get the real IDs.
+
+---
+
+## 3. Confluence REST API — Key Endpoints
+
+```
+GET  /rest/api/content/{pageId}                  fetch a page
+POST /rest/api/content                           create a page
+PUT  /rest/api/content/{pageId}                  update a page
+GET  /rest/api/space                             list spaces
+GET  /rest/api/content/search?cql=...            search content (CQL)
+POST /rest/api/content/{pageId}/child/attachment upload attachment
+```
+
+Space key is required for page creation — find it in your Confluence URL or via `GET /rest/api/space`.
+
+---
+
+## 4. Angular Service Setup
+
+```typescript
+// src/environments/environment.ts
+export const environment = {
+  production: false,
+  jira: {
+    baseUrl: 'https://your-company.atlassian.net',
+    email: import.meta.env['JIRA_EMAIL'],
+    apiToken: import.meta.env['JIRA_API_TOKEN'],
+  },
+  confluence: {
+    baseUrl: 'https://your-company.atlassian.net/wiki',
+  }
+};
+```
+
+```typescript
+// services/jira.service.ts
+@Injectable({ providedIn: 'root' })
+export class JiraService {
+  private readonly http = inject(HttpClient);
+  private readonly base = `${environment.jira.baseUrl}/rest/api/3`;
+
+  private headers() {
+    const creds = btoa(`${environment.jira.email}:${environment.jira.apiToken}`);
+    return new HttpHeaders({
+      Authorization: `Basic ${creds}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    });
+  }
+
+  getIssue(key: string) {
+    return this.http.get(`${this.base}/issue/${key}`, { headers: this.headers() });
+  }
+
+  createIssue(payload: JiraIssuePayload) {
+    return this.http.post(`${this.base}/issue`, payload, { headers: this.headers() });
+  }
+
+  searchIssues(jql: string) {
+    return this.http.get(`${this.base}/search`, {
+      headers: this.headers(),
+      params: { jql, maxResults: '50' }
+    });
+  }
+
+  transitionIssue(key: string, transitionId: string) {
+    return this.http.post(
+      `${this.base}/issue/${key}/transitions`,
+      { transition: { id: transitionId } },
+      { headers: this.headers() }
+    );
+  }
+}
+```
+
+```typescript
+// services/confluence.service.ts
+@Injectable({ providedIn: 'root' })
+export class ConfluenceService {
+  private readonly http = inject(HttpClient);
+  private readonly base = `${environment.confluence.baseUrl}/rest/api`;
+
+  private headers() {
+    const creds = btoa(`${environment.jira.email}:${environment.jira.apiToken}`);
+    return new HttpHeaders({ Authorization: `Basic ${creds}`, Accept: 'application/json' });
+  }
+
+  getPage(pageId: string) {
+    return this.http.get(`${this.base}/content/${pageId}?expand=body.storage`, {
+      headers: this.headers()
+    });
+  }
+
+  createPage(spaceKey: string, title: string, body: string, parentId?: string) {
+    const payload: any = {
+      type: 'page',
+      title,
+      space: { key: spaceKey },
+      body: { storage: { value: body, representation: 'storage' } },
+    };
+    if (parentId) payload.ancestors = [{ id: parentId }];
+    return this.http.post(`${this.base}/content`, payload, { headers: this.headers() });
+  }
+
+  searchPages(cql: string) {
+    return this.http.get(`${this.base}/content/search`, {
+      headers: this.headers(),
+      params: { cql, limit: '25' }
+    });
+  }
+}
+```
+
+---
+
+## 5. CORS — The Biggest Real-World Problem
+
+Browsers block direct calls to Atlassian. You **must** proxy through a backend. Never call Atlassian directly from Angular in production.
+
+**Dev proxy** — `proxy.conf.json`:
+```json
+{
+  "/jira-api": {
+    "target": "https://your-company.atlassian.net",
+    "changeOrigin": true,
+    "pathRewrite": { "^/jira-api": "" },
+    "secure": true
+  },
+  "/confluence-api": {
+    "target": "https://your-company.atlassian.net/wiki",
+    "changeOrigin": true,
+    "pathRewrite": { "^/confluence-api": "" },
+    "secure": true
+  }
+}
+```
+
+Register it in `angular.json` under `serve.options`:
+```json
+"proxyConfig": "proxy.conf.json"
+```
+
+**Production** — set up a real backend proxy (NestJS, Express, AWS API Gateway, NGINX). Your Angular app calls your backend; your backend calls Atlassian with the token. Credentials never touch the browser.
+
+---
+
+## 6. Webhooks (Real-Time Push)
+
+Instead of polling, Jira pushes changes to your backend endpoint.
+
+**In Jira:** Settings → System → WebHooks → Create WebHook → set your backend URL → select events (issue created, updated, commented, transitioned).
+
+```typescript
+// Backend webhook receiver (Node/Express or NestJS)
+app.post('/webhooks/jira', express.json(), (req, res) => {
+  const token = req.headers['x-atlassian-token'];
+  if (!isValidToken(token)) return res.sendStatus(401);
+
+  const { webhookEvent, issue, changelog } = req.body;
+
+  switch (webhookEvent) {
+    case 'jira:issue_created':   handleCreated(issue); break;
+    case 'jira:issue_updated':   handleUpdated(issue, changelog); break;
+    case 'comment_created':      handleComment(issue); break;
+  }
+
+  res.sendStatus(200);
+});
+```
+
+Your backend then pushes updates to Angular clients via WebSocket or Server-Sent Events.
+
+---
+
+## 7. OAuth 2.0 Scopes to Request
+
+**Jira scopes:**
+```
+read:jira-work        read issues, projects, boards
+write:jira-work       create and update issues
+read:jira-user        read user profiles and assignments
+manage:jira-project   project config (only if needed)
+offline_access        get refresh tokens
+```
+
+**Confluence scopes:**
+```
+read:confluence-content.all     read pages and spaces
+write:confluence-content        create and update pages
+read:confluence-space.summary   list available spaces
+```
+
+---
+
+## 8. MCP Server (Advanced — for AI Agent Integration)
+
+Since you're building an AI agent, the cleanest integration is an **Atlassian MCP server** — it exposes Jira/Confluence as tools that Claude can call directly.
+
+```typescript
+// mcp-server/jira-mcp.ts
+import { MCPServer } from '@modelcontextprotocol/sdk';
+
+const server = new MCPServer({
+  name: 'jira-confluence-agent',
+  tools: [
+    {
+      name: 'get_jira_issue',
+      description: 'Fetch a Jira issue by key',
+      inputSchema: { type: 'object', properties: { issueKey: { type: 'string' } } },
+      handler: async ({ issueKey }) => jiraService.getIssue(issueKey),
+    },
+    {
+      name: 'create_jira_issue',
+      description: 'Create a new Jira ticket',
+      handler: async (payload) => jiraService.createIssue(payload),
+    },
+    {
+      name: 'search_confluence',
+      description: 'Search Confluence pages by CQL',
+      handler: async ({ cql }) => confluenceService.searchPages(cql),
+    },
+  ],
+});
+```
+
+Then in your Angular agent, instead of calling the APIs directly, you call the MCP server — and Claude decides which tools to invoke.
+
+---
+
+## 9. Security Checklist
+
+- Store tokens in a secrets manager (AWS Secrets Manager, HashiCorp Vault, Azure Key Vault) — never in `.env` files committed to git
+- Add `.env` to `.gitignore` on day one
+- Use a dedicated service account — tokens don't break when someone leaves
+- Rotate API tokens every 90 days (set a calendar reminder)
+- All calls go through your backend proxy — no credentials in Angular
+- Implement rate limiting — Atlassian caps at ~10 requests/second per token
+- Log all API calls server-side for audit trails
+- Validate webhook signatures on every incoming payload
+
+---
+
+## 10. Setup Order for a Real Project
+
+```
+Step 1 — Admin creates a service account in Atlassian admin panel
+Step 2 — Generate API token for that service account
+Step 3 — Store token in your secrets manager (not .env)
+Step 4 — Run GET /rest/api/3/field to get your instance's custom field IDs
+Step 5 — Build backend proxy (NestJS recommended with Angular)
+Step 6 — Wire JiraService + ConfluenceService in Angular to call your proxy
+Step 7 — Configure OAuth 2.0 if you need per-user access (not shared token)
+Step 8 — Set up Jira webhooks pointing to your backend for real-time events
+Step 9 — (Optional) Wrap everything in an MCP server for AI tool-calling
+Step 10 — Add monitoring/alerting on webhook delivery failures and API errors
+```
+
+The step that catches everyone is **Step 4** — custom field IDs are unique per Jira instance, so story points might be `customfield_10016` at one company and `customfield_10028` at another. Always discover them before hardcoding anything.
+
+
+
+
+====================================================================================================
+
+=Angular 20 Coding Task Agent — fully restructured with the two new analyze modes. Here's a breakdown of what's inside:
+Project structure
+src/app/
+├── models/types.ts                  — AgentMode union, ModeConfig, all constants
+├── services/claude.service.ts       — Anthropic API fetch wrapper
+├── services/prompt-builder.service.ts — Per-mode prompt construction
+├── app.component.ts                 — All reactive state & actions
+├── app.component.html               — Angular 20 template
+└── app.component.scss               — Scoped dark-theme SCSS
+Angular 20 features used
+FeatureWheresignal() & computed()All local state — no RxJS for UI@if / @for / @switchEntire template — zero *ngIf / *ngForinject()Services injected without constructor paramsStandalone componentsNo NgModule anywhereprovideZoneChangeDetectionEvent coalescing in app.config.tscrypto.randomUUID()Criterion item IDs
+Five agent modes
+GroupModeWhat it doesCreate🔍 EvaluateComplexity, risks, effort, DoDCreate📋 Jira TicketFull structured ticket with AC, tech notes, OOS, DoDCreate⚡ Generate CodeWorking code with tests/examplesAnalyze🔬 Analyze JiraQuality score, missing info, risk flags, rewritten versionAnalyze🛡️ Analyze CodeBugs, security CVEs, performance, refactoring with before/after
+To run locally
+bashunzip coding-task-agent-angular20.zip
+cd coding-task-agent
+npm install
+npm start
+Then open http://localhost:4200.Coding task agent angular20ZIP Open in Windows ExplorerYou said: what needs to be configured to connect with jira/confluence in real time projects/companywhat needs to be configured to connect with jira/confluence in real time projects/company10:01 AMIdentified configuration requirements for Jira/Confluence integrationIdentified configuration requirements for Jira/Confluence integrationGreat question. Here's a comprehensive breakdown of everything you need to configure for a real Jira/Confluence integration:1. Authentication & CredentialsAtlassian API Token (most common)
+
+Go to https://id.atlassian.com/manage-profile/security/api-tokens
+Generate a token per service account (not personal accounts in production)
+Store in environment variables — never hardcode
+envJIRA_BASE_URL=https://your-company.atlassian.net
+JIRA_USER_EMAIL=service-account@company.com
+JIRA_API_TOKEN=your_api_token_here
+CONFLUENCE_BASE_URL=https://your-company.atlassian.net/wikiOAuth 2.0 (for user-level access / enterprise)
+
+Register an app at https://developer.atlassian.com/console/myapps/
+Choose "OAuth 2.0 (3LO)" for user-delegated access
+Configure scopes, callback URL, and store client_id + client_secret
+Handle token refresh (expires every 60 minutes)
+Service Account vs Personal TokenPersonal API TokenService AccountBest forLocal dev, testingProduction systemsRevocation riskHigh (tied to one person)LowAudit trailMixedCleanCostFreePaid Atlassian seat2. Jira REST API ConfigurationBase endpoints you'll use regularlyGET  /rest/api/3/issue/{issueKey}          — fetch a ticket
+POST /rest/api/3/issue                     — create a ticket
+PUT  /rest/api/3/issue/{issueKey}          — update a ticket
+GET  /rest/api/3/project                   — list projects
+GET  /rest/api/3/search?jql=...            — query with JQL
+POST /rest/api/3/issue/{issueKey}/comment  — add comment
+GET  /rest/api/3/issue/{issueKey}/transitions — get workflow states
+POST /rest/api/3/issue/{issueKey}/transitions — move to new stateHTTP header setup (Basic Auth)
+typescriptconst headers = {
+  'Authorization': `Basic ${Buffer.from(`${email}:${apiToken}`).toString('base64')}`,
+  'Accept': 'application/json',
+  'Content-Type': 'application/json',
+};Key IDs you must resolve before creating tickets
+
+projectId or projectKey (e.g. ENG, PLAT)
+issuetype.id — Story, Bug, Task, Epic, Spike (varies per project)
+priority.id — not the label, the actual ID
+customfield_XXXXX — every Jira instance has its own field IDs for story points, sprints, components, etc.
+To discover your custom field IDs:
+GET /rest/api/3/field3. Confluence REST API ConfigurationGET  /rest/api/content/{pageId}                    — fetch a page
+POST /rest/api/content                             — create a page
+PUT  /rest/api/content/{pageId}                    — update a page
+GET  /rest/api/space                               — list spaces
+GET  /rest/api/content/search?cql=...              — search content
+POST /rest/api/content/{pageId}/child/attachment   — add attachmentSpace key — required for creating pages (e.g. ENG, DEVOPS, PROD)4. Angular Service Setup (for your project)typescript// src/environments/environment.ts
+export const environment = {
+  production: false,
+  jira: {
+    baseUrl: 'https://your-company.atlassian.net',
+    email: import.meta.env['JIRA_EMAIL'],
+    apiToken: import.meta.env['JIRA_API_TOKEN'],
+  },
+  confluence: {
+    baseUrl: 'https://your-company.atlassian.net/wiki',
+  }
+};typescript// jira.service.ts
+@Injectable({ providedIn: 'root' })
+export class JiraService {
+  private readonly http = inject(HttpClient);
+  private readonly base = `${environment.jira.baseUrl}/rest/api/3`;
+ 
+  private get authHeader(): string {
+    const creds = `${environment.jira.email}:${environment.jira.apiToken}`;
+    return `Basic ${btoa(creds)}`;
+  }
+
+  private headers() {
+    return new HttpSonnet 4.6 Adaptive
+
+
+
+
